@@ -1,210 +1,222 @@
-#include <Wire.h>
-#include "Adafruit_MPR121.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
-#include <SPI.h>
 #include <Arduino.h>
-#include "ESP32_NOW_Serial.h"
-#include "MacAddress.h"
-#include "WiFi.h"
-#include "esp_wifi.h"
+#include "BLEDevice.h"
 
-#ifndef _BV
-#define _BV(bit) (1 << (bit))
-#endif
+// GPIO0 is the BOOT button on most ESP32-S3 DevKits.
+// (GPIO48 is often the onboard RGB LED, so it can't also be a button.)
+#define BUTTON 20
 
-// keyboard
-#define SDA_PIN 6
-#define SCL_PIN 9
-
-// built-in RGB LED (GPIO8 on C6 DevKitC)
-#ifdef RGB_BUILTIN
-  #define LED RGB_BUILTIN
-#else
-  #define LED 8
-#endif
-
-// screen -- FILL IN YOUR REAL SPI PINS
-#define CS_PIN  4
-#define RST_PIN 10
-#define DC_PIN  7
-#define SCK_PIN  21   // <-- change to your wiring
-#define MOSI_PIN 19   // <-- change to your wiring
-
-#define CODE_LEN  4
-#define CLEAR_PAD 11
-#define PASSCODE  "1234"
-
-#define STAR_SIZE 5
-#define STAR_W    (6 * STAR_SIZE)
-#define STAR_H    (8 * STAR_SIZE)
-#define STAR_X0   ((240 - CODE_LEN * STAR_W) / 2)
-#define STAR_Y    ((240 - STAR_H) / 2)
-
-#define ESPNOW_WIFI_CHANNEL 1
-#define ESPNOW_WIFI_MODE WIFI_STA
-#define ESPNOW_WIFI_IF   WIFI_IF_STA
-
-const MacAddress peer_mac({0x94, 0xA9, 0x90, 0xDD, 0x31, 0x38});
-ESP_NOW_Serial_Class NowSerial(peer_mac, ESPNOW_WIFI_CHANNEL, ESPNOW_WIFI_IF);
-
-// Protocol bytes
-#define MSG_DISARM 1
-#define MSG_ARM    2
+// Protocol bytes (must match the C6 keypad sketch)
+#define ARM        2
+#define DISARM     1
 #define MSG_HEART  'H'
 
 #define HEARTBEAT_MS   500
 #define TIMEOUT_MS     2000
 #define BLINK_TOTAL_MS 3000
 #define BLINK_HALF_MS  250
+#define DEBOUNCE_MS    50
 #define DISARM_MS      30000
 
-uint8_t  state = MSG_ARM;      // only ever ARM or DISARM
-bool     connected = false;
-uint32_t lastRx = 0, lastHeartbeat = 0, blinkUntil = 0, disarmStart = 0;
+#undef RGB_BUILTIN
+#define RGB_BUILTIN 38
 
-Adafruit_MPR121 cap = Adafruit_MPR121();
-Adafruit_ST7789 tft = Adafruit_ST7789(CS_PIN, DC_PIN, RST_PIN);
+// ---- BLE (same UUIDs as the keypad server) ----
+static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+static BLEUUID charUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8");
 
-uint16_t lasttouched = 0, currtouched = 0;
-char code[CODE_LEN + 1] = {0};
-uint8_t codeIndex = 0;
+static boolean doConnect = false;
+static boolean bleConnected = false;   // BLE link up
+static boolean doScan = false;
+static BLERemoteCharacteristic *pRemoteCharacteristic = nullptr;
+static BLEAdvertisedDevice *myDevice = nullptr;
 
-void drawStar(uint8_t index) {
-  tft.setTextSize(STAR_SIZE);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(STAR_X0 + index * STAR_W, STAR_Y);
-  tft.print('*');
+uint8_t  state = ARM;          // only ever ARM or DISARM
+bool     connected = false;    // BLE link up AND heartbeat recent
+uint32_t lastRx = 0, lastHeartbeat = 0, blinkUntil = 0, lastPress = 0;
+bool     lastButton = HIGH;
+uint32_t disarmStart = 0;
+
+// Ring buffer: BLE task -> loop()
+#define RX_BUF_SIZE 32
+volatile uint8_t rxBuf[RX_BUF_SIZE];
+volatile uint8_t rxHead = 0, rxTail = 0;
+
+void rxPush(uint8_t b) {
+  uint8_t next = (rxHead + 1) % RX_BUF_SIZE;
+  if (next == rxTail) return;  // full, drop
+  rxBuf[rxHead] = b;
+  rxHead = next;
 }
 
-void clearStars() {
-  tft.fillRect(STAR_X0, STAR_Y, CODE_LEN * STAR_W, STAR_H, ST77XX_BLACK);
+bool rxPop(uint8_t &b) {
+  if (rxTail == rxHead) return false;
+  b = rxBuf[rxTail];
+  rxTail = (rxTail + 1) % RX_BUF_SIZE;
+  return true;
 }
 
-void resetCode() {
-  codeIndex = 0;
-  memset(code, 0, sizeof(code));
+// Notifications from the keypad
+static void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify) {
+  for (size_t i = 0; i < length; i++) rxPush(pData[i]);
 }
 
-// Change state locally and tell the peer
-void setState(uint8_t s, bool notify = true) {
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient *pclient) {}
+
+  void onDisconnect(BLEClient *pclient) {
+    bleConnected = false;
+    doScan = true;
+    Serial.println("onDisconnect");
+  }
+};
+
+bool connectToServer() {
+  Serial.print("Forming a connection to ");
+  Serial.println(myDevice->getAddress().toString().c_str());
+
+  BLEClient *pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  if (!pClient->connect(myDevice)) {
+    Serial.println("Connect failed");
+    return false;
+  }
+
+  BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
+  if (pRemoteService == nullptr) {
+    Serial.println("Service not found");
+    pClient->disconnect();
+    return false;
+  }
+
+  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+  if (pRemoteCharacteristic == nullptr) {
+    Serial.println("Characteristic not found");
+    pClient->disconnect();
+    return false;
+  }
+
+  if (pRemoteCharacteristic->canNotify()) {
+    pRemoteCharacteristic->registerForNotify(notifyCallback);
+  }
+
+  bleConnected = true;
+  return true;
+}
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = false;
+    }
+  }
+};
+
+void bleSend(uint8_t b) {
+  if (bleConnected && pRemoteCharacteristic) {
+    pRemoteCharacteristic->writeValue(&b, 1, false);
+  }
+}
+
+void sendState() {
+  bleSend(state);
+}
+
+void setState(uint8_t s, bool notify) {
   if (s == state) return;
   state = s;
-  if (state == MSG_DISARM) disarmStart = millis();
-  resetCode();
-  clearStars();
-  Serial.println(state == MSG_DISARM ? "DISARM" : "ARM");
-  if (notify && NowSerial.availableForWrite()) NowSerial.write(state);
-}
-
-void handlePress(uint8_t pad) {
-  if (pad == CLEAR_PAD) {
-    resetCode();
-    clearStars();
-    Serial.println("Entry cleared");
-    return;
-  }
-  if (pad > 9 || codeIndex >= CODE_LEN) return;
-
-  code[codeIndex] = '0' + pad;
-  drawStar(codeIndex);
-  codeIndex++;
-
-  if (codeIndex == CODE_LEN) {
-    bool ok = (strcmp(code, PASSCODE) == 0);   // compare BEFORE reset
-    Serial.println(ok ? "Code OK" : "Wrong code");
-    delay(200);
-    resetCode();
-    clearStars();
-    if (ok) setState(MSG_DISARM);
-  }
+  if (state == DISARM) disarmStart = millis();
+  Serial.println(state == DISARM ? "DISARM" : "ARM");
+  if (notify) sendState();
 }
 
 void updateLed(uint32_t now) {
   if ((int32_t)(blinkUntil - now) > 0) {
-    // disconnect indication: blink blue
     bool on = ((now / BLINK_HALF_MS) % 2) == 0;
-    rgbLedWrite(LED, 0, 0, on ? 255 : 0);
-  } else if (state == MSG_DISARM) {
-    rgbLedWrite(LED, 0, 255, 0);
+    rgbLedWrite(RGB_BUILTIN, 0, 0, on ? 255 : 0);   // disconnect blink
+  } else if (state == DISARM) {
+    rgbLedWrite(RGB_BUILTIN, 0, 255, 0);
   } else {
-    rgbLedWrite(LED, 255, 0, 0);
+    rgbLedWrite(RGB_BUILTIN, 255, 0, 0);
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  uint32_t start = millis();
-  while (!Serial && millis() - start < 3000) delay(10);
+  pinMode(BUTTON, INPUT_PULLDOWN);
 
-  Wire.begin(SDA_PIN, SCL_PIN);
-  if (!cap.begin(0x5A, &Wire)) {
-    Serial.println("MPR121 not found, check wiring?");
-    while (1) delay(10);
-  }
-  cap.setAutoconfig(true);
+  Serial.println("Starting Arduino BLE Client application...");
+  BLEDevice::init("");
 
-  // screen
-  SPI.begin(SCK_PIN, -1, MOSI_PIN, CS_PIN);
-  tft.init(240, 240, SPI_MODE3);
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextSize(3);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(40, 100);
-  tft.print("READY");       // proves the display works
-  delay(1000);
-  tft.fillScreen(ST77XX_BLACK);
+  BLEScan *pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(5, false);
 
-  WiFi.mode(ESPNOW_WIFI_MODE);
-  WiFi.setChannel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  while (!(WiFi.STA.started() || WiFi.AP.started())) delay(100);
-  Serial.println(WiFi.macAddress());
-
-  NowSerial.begin(115200);
-
-  blinkUntil = millis() + BLINK_TOTAL_MS;  // start "disconnected"
+  lastButton = digitalRead(BUTTON);
+  blinkUntil = millis() + BLINK_TOTAL_MS;   // start "disconnected"
 }
 
 void loop() {
   uint32_t now = millis();
 
+  // ---- BLE connect / rescan (per the example) ----
+  if (doConnect) {
+    if (connectToServer()) {
+      Serial.println("We are now connected to the BLE Server.");
+    } else {
+      Serial.println("Failed to connect; will rescan.");
+      doScan = true;
+    }
+    doConnect = false;
+  }
+  if (!bleConnected && doScan) {
+    BLEDevice::getScan()->start(0);   // scan until the keypad is found
+    doScan = false;
+  }
+
   // ---- receive ----
-  while (NowSerial.available()) {
-    int b = NowSerial.read();
-    if (b < 0) break;
+  uint8_t b;
+  while (rxPop(b)) {
     lastRx = now;
-    if (b == MSG_DISARM || b == MSG_ARM) setState((uint8_t)b, false);
-    // 'H' just counts as "alive"
+    if (b == ARM || b == DISARM) setState(b, false);
+    // 'H' only means "alive"
   }
 
   // ---- connection tracking ----
-  bool nowConnected = (lastRx != 0) && (now - lastRx < TIMEOUT_MS);
+  if (!bleConnected) lastRx = 0;   // link dropped: forget last heartbeat
+  bool nowConnected = bleConnected && (lastRx != 0) && (now - lastRx < TIMEOUT_MS);
   if (connected && !nowConnected) {
-    blinkUntil = now + BLINK_TOTAL_MS;   // blink, then fall back to state color
+    blinkUntil = now + BLINK_TOTAL_MS;
     Serial.println("DISCONNECTED");
   } else if (!connected && nowConnected) {
     Serial.println("CONNECTED");
+    sendState();   // resync after reconnect
   }
   connected = nowConnected;
 
   // ---- heartbeat ----
-  if (now - lastHeartbeat >= HEARTBEAT_MS && NowSerial.availableForWrite()) {
-    NowSerial.write(MSG_HEART);
+  if (now - lastHeartbeat >= HEARTBEAT_MS) {
+    bleSend(MSG_HEART);
     lastHeartbeat = now;
   }
 
-  // ---- touch / state logic ----
-  currtouched = cap.touched();
-  uint16_t pressed = currtouched & ~lasttouched;   // new presses only
-
-  if (state == MSG_ARM) {
-    for (uint8_t i = 0; i < 12; i++) {
-      if (pressed & _BV(i)) handlePress(i);
-    }
-  } else if (state == MSG_DISARM) {
-    if (pressed || (now - disarmStart >= DISARM_MS)) setState(MSG_ARM);
+  // ---- button (edge-detected, debounced) ----
+  bool button = digitalRead(BUTTON);
+  if (lastButton == HIGH && button == LOW && now - lastPress > DEBOUNCE_MS) {
+    lastPress = now;
+    setState(state == ARM ? DISARM : ARM, true);
   }
-  lasttouched = currtouched;
+  lastButton = button;
+
+  if (state == DISARM) {
+    if ((now - disarmStart >= DISARM_MS)) setState(ARM, true);
+  }
 
   updateLed(now);
   delay(10);
