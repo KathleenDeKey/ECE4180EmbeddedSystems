@@ -115,6 +115,26 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
+// Scanning and connecting can block for seconds, so they run in their own
+// task. loop() (LED, button, heartbeat timers) is never held up by them.
+void bleTask(void *param) {
+  for (;;) {
+    if (doConnect) {
+      if (connectToServer()) {
+        Serial.println("We are now connected to the BLE Server.");
+      } else {
+        Serial.println("Failed to connect; will rescan.");
+      }
+      doConnect = false;
+    } else if (!bleConnected) {
+      BLEScan *s = BLEDevice::getScan();
+      s->start(3, false);     // blocks this task only, for up to 3 s
+      s->clearResults();
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 void bleSend(uint8_t b) {
   if (bleConnected && pRemoteCharacteristic) {
     pRemoteCharacteristic->writeValue(&b, 1, false);
@@ -156,7 +176,7 @@ void setup() {
   pBLEScan->setInterval(1349);
   pBLEScan->setWindow(449);
   pBLEScan->setActiveScan(true);
-  pBLEScan->start(5, false);
+  xTaskCreate(bleTask, "bleTask", 8192, nullptr, 1, nullptr);
 
   lastButton = digitalRead(BUTTON);
   blinkUntil = millis() + BLINK_TOTAL_MS;   // start "disconnected"
@@ -165,20 +185,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // ---- BLE connect / rescan (per the example) ----
-  if (doConnect) {
-    if (connectToServer()) {
-      Serial.println("We are now connected to the BLE Server.");
-    } else {
-      Serial.println("Failed to connect; will rescan.");
-      doScan = true;
-    }
-    doConnect = false;
-  }
-  if (!bleConnected && doScan) {
-    BLEDevice::getScan()->start(0);   // scan until the keypad is found
-    doScan = false;
-  }
+  // (BLE scanning / connecting now happens in bleTask)
 
   // ---- receive ----
   uint8_t b;
