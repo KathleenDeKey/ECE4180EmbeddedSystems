@@ -6,7 +6,7 @@
 #endif
 
 // ---- CHANGE THESE to the GPIOs you actually wired ----
-#define SDA_PIN 8
+#define SDA_PIN 6
 #define SCL_PIN 9
 
 // Set to true for detailed filtered/baseline data
