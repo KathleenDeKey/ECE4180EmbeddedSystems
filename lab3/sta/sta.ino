@@ -19,7 +19,7 @@
 // ---- Change these ---------------------------------------------------------
 const char *ssid = "iPhone (173)";
 const char *password = "hello123";
-const char *timeUrl = "https://utctime.app/api/now";
+const char *timeUrl = "https://utctime.app/api/now/America/New_York";
 const unsigned long pollPeriodMs = 10000;
 // ---------------------------------------------------------------------------
 
@@ -47,14 +47,19 @@ void fetchCurrentTime() {
       Serial.println(err.c_str());
     } else {
       //Serial.print(doc);
-      String datetime = doc["utc_iso"] | "";      // "2026-10-22T14:30:05.123456-04:00"
+      String datetime = doc["datetime"] | "";      // "2026-10-22T14:30:05.123456-04:00"
       // String tz = doc["timezone"] | "";
       // String abbr = doc["abbreviation"] | "";
       
-      Serial.println(datetime);
       if (datetime.length() >= 19) {
+        String date = datetime.substring(0, 10);    
+        String time = datetime.substring(11, 19);  
+
         Serial.println("-----------------------------");
-        
+        Serial.print("Date: ");
+        Serial.println(date);
+        Serial.print("Time: ");
+        Serial.println(time);
         Serial.println("-----------------------------");
       } else {
         Serial.println("\"datetime\" field missing or malformed");
